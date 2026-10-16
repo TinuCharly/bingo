@@ -1,13 +1,23 @@
 'use client';
 
-import { useEffect, useState, useRef, useMemo } from 'react';
-import { useRouter } from 'next/navigation';
+import { useCallback, useEffect, useState, useRef, useMemo } from 'react';
+import { useParams, useRouter } from 'next/navigation';
 import { useGameStore, Room, Player } from '@/store/gameStore';
-import { getSocket } from '@/lib/socket';
+import {
+  chooseNumber,
+  completeSetup,
+  getRoom,
+  markNumber,
+  resolveTurnTimeout,
+  startGame,
+  submitGrid,
+  subscribeToRoom
+} from '@/lib/gameApi';
+import { ensurePlayerSession } from '@/lib/supabase';
 import { 
   UsersIcon, PlayIcon, ArrowPathIcon, TrophyIcon, 
   ClockIcon, CheckCircleIcon, SparklesIcon,
-  ExclamationTriangleIcon, LightBulbIcon
+  ExclamationTriangleIcon, LightBulbIcon, ClipboardDocumentIcon
 } from '@heroicons/react/24/solid';
 import clsx from 'clsx';
 import confetti from 'canvas-confetti';
@@ -24,7 +34,7 @@ export interface ValidationError {
   conflictingCellIndex?: number;
 }
 
-const getPlayerScore = (grid: (number | null)[] | undefined, markedNumbers: number[], size: number) => {
+const getPlayerScore = (grid: (number | null)[] | null | undefined, markedNumbers: number[], size: number) => {
     if (!grid || grid.length === 0) return 0;
     const markedSet = new Set(markedNumbers);
     let stars = 0;
@@ -46,6 +56,46 @@ const getPlayerScore = (grid: (number | null)[] | undefined, markedNumbers: numb
     if (d1Win) stars++;
     if (d2Win) stars++;
     return stars;
+};
+
+const getCompletedLines = (
+  grid: (number | null)[] | null | undefined,
+  markedNumbers: number[],
+  size: number
+) => {
+  if (!grid || grid.length !== size * size) return [];
+
+  const marked = new Set(markedNumbers);
+  const lines: { key: string; cells: number[] }[] = [];
+  const isComplete = (indexes: number[]) => indexes.every(index => {
+    const value = grid[index];
+    return value !== null && value !== undefined && marked.has(value);
+  });
+
+  for (let row = 0; row < size; row++) {
+    const cells = Array.from({ length: size }, (_, col) => row * size + col);
+    if (isComplete(cells)) {
+      lines.push({ key: `row-${row}`, cells });
+    }
+  }
+
+  for (let col = 0; col < size; col++) {
+    const cells = Array.from({ length: size }, (_, row) => row * size + col);
+    if (isComplete(cells)) {
+      lines.push({ key: `col-${col}`, cells });
+    }
+  }
+
+  const mainDiagonal = Array.from({ length: size }, (_, index) => index * size + index);
+  if (isComplete(mainDiagonal)) {
+    lines.push({ key: 'diagonal-main', cells: mainDiagonal });
+  }
+  const reverseDiagonal = Array.from({ length: size }, (_, index) => index * size + size - 1 - index);
+  if (isComplete(reverseDiagonal)) {
+    lines.push({ key: 'diagonal-reverse', cells: reverseDiagonal });
+  }
+
+  return lines;
 };
 
 const getPlayingCellSizeClass = (size: number) => {
@@ -152,8 +202,15 @@ const validateGridCell = (
 
 export default function GameRoom() {
   const router = useRouter();
-  const { playerName, room, setRoom } = useGameStore();
-  const socket = getSocket();
+  const { id: routeRoomId } = useParams<{ id: string }>();
+  const { playerName, playerId, room, setPlayerId, setPlayerName, setRoom, setRoomId } = useGameStore();
+  const bingoGridRef = useRef<HTMLDivElement>(null);
+  const bingoCellRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const handledSetupDeadlineRef = useRef<string | null>(null);
+  const handledTurnDeadlineRef = useRef<string | null>(null);
+  const [lineOverlaySize, setLineOverlaySize] = useState({ width: 0, height: 0 });
+  const [lineGeometry, setLineGeometry] = useState<{ key: string; x1: number; y1: number; x2: number; y2: number }[]>([]);
+  const [gameError, setGameError] = useState('');
 
   const totalCells = room ? room.gridSize * room.gridSize : 25;
   const maxNumber = totalCells;
@@ -170,21 +227,67 @@ export default function GameRoom() {
 
   const [setupTimer, setSetupTimer] = useState(120);
   const [turnTimer, setTimer] = useState(0);
-  const [chosenNumber, setChosenNumber] = useState<number | null>(null);
-  const [turnAlert, setTurnAlert] = useState<string | null>(null);
 
   const [focusedCell, setFocusedCell] = useState<number | null>(null);
   const [lastEditedCell, setLastEditedCell] = useState<number | null>(null);
+  const [validatedCells, setValidatedCells] = useState<Set<number>>(() => new Set());
   const [shakingCell, setShakingCell] = useState<number | null>(null);
   const [submitErrorMessage, setSubmitErrorMessage] = useState<{ title: string; reason: string; fix: string } | null>(null);
+  const [copyMessage, setCopyMessage] = useState('');
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const chosenNumber = room?.currentChosenNumber ?? null;
+
+  const applyRoomUpdate = useCallback((updatedRoom: Room) => {
+    const previousRoom = useGameStore.getState().room;
+    if (updatedRoom.status === 'setup' && previousRoom?.status !== 'setup') {
+      setGridInputs(new Array(updatedRoom.gridSize * updatedRoom.gridSize).fill(''));
+      setSetupTimer(120);
+      setFocusedCell(null);
+      setLastEditedCell(null);
+      setValidatedCells(new Set());
+      setSubmitErrorMessage(null);
+    }
+    setRoom(updatedRoom);
+  }, [setRoom]);
 
   useEffect(() => {
-    if (!playerName || !room) {
-      router.push('/');
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+
+    if (!routeRoomId) {
+      router.replace('/');
+      return;
     }
-  }, [playerName, room, router]);
+
+    void (async () => {
+      try {
+        const id = await ensurePlayerSession();
+        if (!active) return;
+        setPlayerId(id);
+        setRoomId(routeRoomId);
+
+        const initialRoom = await getRoom(routeRoomId);
+        if (!active) return;
+        applyRoomUpdate(initialRoom);
+        setPlayerName(initialRoom.players.find(player => player.id === id)?.name ?? playerName);
+        unsubscribe = subscribeToRoom(
+          routeRoomId,
+          applyRoomUpdate,
+          error => setGameError(error.message)
+        );
+      } catch (error) {
+        if (!active) return;
+        setGameError(error instanceof Error ? error.message : 'Could not load this room.');
+        router.replace('/');
+      }
+    })();
+
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [applyRoomUpdate, playerName, routeRoomId, router, setPlayerId, setPlayerName, setRoomId]);
 
   useEffect(() => {
     if (room?.status === 'finished') {
@@ -207,87 +310,67 @@ export default function GameRoom() {
   }, [room?.status]);
 
   useEffect(() => {
-    const handleRoomUpdated = (updatedRoom: Room) => setRoom(updatedRoom);
-    const handleGameStatusChanged = ({ status, room: r }: { status: string; room: Room }) => {
-      setRoom(r);
-      if (status === 'setup') {
-        const requiredLength = r.gridSize * r.gridSize;
-        setGridInputs(new Array(requiredLength).fill(''));
-        setSetupTimer(120);
-        setFocusedCell(null);
-        setLastEditedCell(null);
-        setSubmitErrorMessage(null);
-      }
-    };
-    const handleNumberChosen = ({ number, chooserName }: { number: number; chooserId: string; chooserName: string }) => {
-      setChosenNumber(number);
-      setTurnAlert(`${chooserName} chose ${number}!`);
-      setTimer(30);
-      
-      if (containerRef.current) {
-        gsap.fromTo(containerRef.current, { x: -5 }, { x: 5, duration: 0.1, yoyo: true, repeat: 3, ease: "power1.inOut" });
-        gsap.set(containerRef.current, { x: 0, delay: 0.4 });
-      }
-    };
-    const handleNextTurn = ({ room: r }: { currentTurnIndex: number; room: Room }) => {
-      setRoom(r);
-      setChosenNumber(null);
-      setTurnAlert(null);
-    };
-    const handleGameOver = ({ room: r }: { winners: string; room: Room }) => {
-      setRoom(r);
-      setChosenNumber(null);
-      setTurnAlert(`Game Over!`);
-    };
+    if (room?.status !== 'setup') return;
+    const interval = setInterval(() => {
+      const secondsLeft = room.setupDeadline
+        ? Math.max(0, Math.ceil((Date.parse(room.setupDeadline) - Date.now()) / 1000))
+        : 120;
+      setSetupTimer(secondsLeft);
 
-    socket.on('roomUpdated', handleRoomUpdated);
-    socket.on('gameStatusChanged', handleGameStatusChanged);
-    socket.on('numberChosen', handleNumberChosen);
-    socket.on('nextTurn', handleNextTurn);
-    socket.on('gameOver', handleGameOver);
-    socket.on('playerMarked', () => { /* Player marked visual */ });
-
-    return () => {
-      socket.off('roomUpdated', handleRoomUpdated);
-      socket.off('gameStatusChanged', handleGameStatusChanged);
-      socket.off('numberChosen', handleNumberChosen);
-      socket.off('nextTurn', handleNextTurn);
-      socket.off('gameOver', handleGameOver);
-      socket.off('playerMarked');
-    };
-  }, [socket, setRoom]);
+      if (secondsLeft === 0 && room.setupDeadline && handledSetupDeadlineRef.current !== room.setupDeadline) {
+        handledSetupDeadlineRef.current = room.setupDeadline;
+        void completeSetup(room.id).then(applyRoomUpdate).catch(error => {
+          setGameError(error instanceof Error ? error.message : 'Could not finish grid setup.');
+        });
+      }
+    }, 250);
+    return () => clearInterval(interval);
+  }, [applyRoomUpdate, room?.id, room?.setupDeadline, room?.status]);
 
   useEffect(() => {
-    if (room?.status === 'setup') {
-      const int = setInterval(() => setSetupTimer(prev => Math.max(0, prev - 1)), 1000);
-      return () => clearInterval(int);
+    if (room?.status !== 'playing' || !room.currentChosenNumber || !room.turnDeadline) {
+      return;
     }
-  }, [room?.status]);
+    const deadline = room.turnDeadline;
 
-  useEffect(() => {
-    if (chosenNumber !== null) {
-      const int = setInterval(() => setTimer(prev => Math.max(0, prev - 1)), 1000);
-      return () => clearInterval(int);
-    }
-  }, [chosenNumber]);
+    const updateTimer = () => {
+      const secondsLeft = Math.max(0, Math.ceil((Date.parse(deadline) - Date.now()) / 1000));
+      setTimer(secondsLeft);
+      if (secondsLeft === 0 && handledTurnDeadlineRef.current !== deadline) {
+        handledTurnDeadlineRef.current = deadline;
+        void resolveTurnTimeout(room.id).then(applyRoomUpdate).catch(error => {
+          setGameError(error instanceof Error ? error.message : 'Could not resolve the expired turn.');
+        });
+      }
+    };
+
+    updateTimer();
+    const interval = setInterval(updateTimer, 250);
+    return () => clearInterval(interval);
+  }, [applyRoomUpdate, room?.currentChosenNumber, room?.id, room?.status, room?.turnDeadline]);
 
   // Real-time error computation for all cells
   const allErrors = useMemo(() => {
     return gridInputs.map((val, idx) => validateGridCell(idx, val, gridInputs, size));
   }, [gridInputs, size]);
 
+  const visibleErrors = useMemo(
+    () => allErrors.map((error, index) => validatedCells.has(index) ? error : null),
+    [allErrors, validatedCells]
+  );
+
   // Determine active error for banner display
   const activeError = useMemo(() => {
-    if (focusedCell !== null && allErrors[focusedCell]) {
-      return allErrors[focusedCell];
+    if (focusedCell !== null && visibleErrors[focusedCell]) {
+      return visibleErrors[focusedCell];
     }
-    if (lastEditedCell !== null && allErrors[lastEditedCell]) {
-      return allErrors[lastEditedCell];
+    if (lastEditedCell !== null && visibleErrors[lastEditedCell]) {
+      return visibleErrors[lastEditedCell];
     }
-    const firstErr = allErrors.find((e): e is ValidationError => e !== null);
+    const firstErr = visibleErrors.find((e): e is ValidationError => e !== null);
     if (firstErr) return firstErr;
     return null;
-  }, [focusedCell, lastEditedCell, allErrors]);
+  }, [focusedCell, lastEditedCell, visibleErrors]);
 
   // Real-time used & unused numbers tracker
   const usedNumbers = useMemo(() => {
@@ -322,14 +405,72 @@ export default function GameRoom() {
     return filledCount === maxNumber && allErrors.every(e => e === null);
   }, [filledCount, maxNumber, allErrors]);
 
+  const me = room?.players.find((p: Player) => p.id === playerId);
+  const completedLines = useMemo(
+    () => getCompletedLines(me?.grid, me?.markedNumbers ?? [], room?.gridSize ?? 0),
+    [me?.grid, me?.markedNumbers, room?.gridSize]
+  );
+  const completedLineCells = new Set(completedLines.flatMap(line => line.cells));
+
+  useEffect(() => {
+    const board = bingoGridRef.current;
+    if (!board || room?.status !== 'playing') return;
+
+    const updateLineGeometry = () => {
+      const boardRect = board.getBoundingClientRect();
+      setLineOverlaySize({ width: boardRect.width, height: boardRect.height });
+      setLineGeometry(completedLines.flatMap(line => {
+        const firstCell = bingoCellRefs.current[line.cells[0]];
+        const lastCell = bingoCellRefs.current[line.cells[line.cells.length - 1]];
+        if (!firstCell || !lastCell) return [];
+
+        const firstRect = firstCell.getBoundingClientRect();
+        const lastRect = lastCell.getBoundingClientRect();
+        return [{
+          key: line.key,
+          x1: firstRect.left + firstRect.width / 2 - boardRect.left,
+          y1: firstRect.top + firstRect.height / 2 - boardRect.top,
+          x2: lastRect.left + lastRect.width / 2 - boardRect.left,
+          y2: lastRect.top + lastRect.height / 2 - boardRect.top
+        }];
+      }));
+    };
+
+    updateLineGeometry();
+    const observer = new ResizeObserver(updateLineGeometry);
+    observer.observe(board);
+    return () => observer.disconnect();
+  }, [completedLines, room?.status]);
+
   if (!room) return null;
 
-  const me = room.players.find((p: Player) => p.id === socket.id);
-  const isCreator = room.players[0]?.id === socket.id;
-  const isMyTurn = room.players[room.currentTurnIndex]?.id === socket.id;
+  const turnAlert = chosenNumber === null
+    ? null
+    : `${room.players[room.currentTurnIndex]?.name ?? 'A player'} chose ${chosenNumber}!`;
+  const isCreator = room.players[0]?.id === playerId;
+  const isMyTurn = room.players[room.currentTurnIndex]?.id === playerId;
+  const finalScores = room.players
+    .map(player => ({
+      player,
+      score: getPlayerScore(player.grid, player.markedNumbers, room.gridSize)
+    }))
+    .sort((a, b) => {
+      const aIsWinner = a.player.id === room.winnerPlayerId || (!room.winnerPlayerId && a.player.name === room.winner);
+      const bIsWinner = b.player.id === room.winnerPlayerId || (!room.winnerPlayerId && b.player.name === room.winner);
+      return Number(bIsWinner) - Number(aIsWinner) || b.score - a.score;
+    });
+
+  const performRoomAction = async (action: () => Promise<Room>) => {
+    setGameError('');
+    try {
+      applyRoomUpdate(await action());
+    } catch (error) {
+      setGameError(error instanceof Error ? error.message : 'The game action could not be completed.');
+    }
+  };
 
   const handleStart = () => {
-    socket.emit('startGame', room.id);
+    void performRoomAction(() => startGame(room.id));
   };
 
   const handleInputChange = (index: number, val: string) => {
@@ -338,12 +479,6 @@ export default function GameRoom() {
     const newInputs = [...gridInputs];
     newInputs[index] = val;
     setGridInputs(newInputs);
-
-    const err = validateGridCell(index, val, newInputs, size);
-    if (err) {
-      setShakingCell(index);
-      setTimeout(() => setShakingCell(null), 350);
-    }
   };
 
   const handleInsertNumber = (num: number) => {
@@ -374,6 +509,7 @@ export default function GameRoom() {
     setGridInputs(nums.map(n => n.toString()));
     setFocusedCell(null);
     setLastEditedCell(null);
+    setValidatedCells(new Set());
   };
 
   const handleClearAll = () => {
@@ -381,12 +517,14 @@ export default function GameRoom() {
     setGridInputs(new Array(maxNumber).fill(''));
     setFocusedCell(null);
     setLastEditedCell(null);
+    setValidatedCells(new Set());
   };
 
   const handleSubmitGrid = () => {
     // 1. Check for cell errors
     const firstErrIdx = allErrors.findIndex(e => e !== null);
     if (firstErrIdx !== -1) {
+      setValidatedCells(new Set(allErrors.flatMap((error, index) => error ? [index] : [])));
       const err = allErrors[firstErrIdx]!;
       setFocusedCell(firstErrIdx);
       setLastEditedCell(firstErrIdx);
@@ -421,7 +559,16 @@ export default function GameRoom() {
 
     // 3. Emit valid grid
     const finalGrid = gridInputs.map(v => parseInt(v.trim(), 10));
-    socket.emit('submitGrid', { roomId: room.id, grid: finalGrid });
+    void performRoomAction(() => submitGrid(room.id, finalGrid));
+  };
+
+  const handleCopyRoomId = async () => {
+    try {
+      await navigator.clipboard.writeText(room.id);
+      setCopyMessage('Room ID copied!');
+    } catch {
+      setCopyMessage('Could not copy the room ID. Please copy it manually.');
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, i: number) => {
@@ -456,22 +603,27 @@ export default function GameRoom() {
     const isMarked = me?.markedNumbers.includes(num);
     
     if (chosenNumber === null && isMyTurn && !isMarked) {
-      socket.emit('chooseNumber', { roomId: room.id, number: num });
+      void performRoomAction(() => chooseNumber(room.id, num));
     } else if (chosenNumber !== null && chosenNumber === num && !isMarked) {
-      socket.emit('markNumber', { roomId: room.id });
+      void performRoomAction(() => markNumber(room.id));
     }
   };
 
   return (
     <>
-    <AuroraBackground 
-        className="absolute inset-0 w-full h-full -z-10"
-        style={{ aspectRatio: 'auto' }} speed={10}      />
-      <div className="cloud-bg">
-        <div className="cloud cloud1"></div>
-        <div className="cloud cloud2"></div>
-        <div className="cloud cloud3"></div>
-      </div>
+      {room.status === 'waiting' ? (
+        <AuroraBackground 
+          className="fixed inset-0 w-full h-full z-0 pointer-events-none"
+          style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh', zIndex: 0 }}
+          speed={25}
+        />
+      ) : (
+        <div className="cloud-bg">
+          <div className="cloud cloud1"></div>
+          <div className="cloud cloud2"></div>
+          <div className="cloud cloud3"></div>
+        </div>
+      )}
       
       <div className="min-h-screen p-4 flex flex-col items-center max-w-6xl mx-auto relative z-10" ref={containerRef}>
         
@@ -479,7 +631,19 @@ export default function GameRoom() {
         <div className="w-full flex flex-col sm:flex-row justify-between items-center bg-white/40 backdrop-blur-md p-4 rounded-3xl border-4 border-white mb-6 shadow-lg">
           <div className="text-center sm:text-left mb-2 sm:mb-0">
             <h2 className="text-2xl font-black text-[#ff8f00] drop-shadow-md">{room.name}</h2>
-            <p className="text-sm font-bold text-[#37474f]">Room ID: {room.id} • {room.gridSize}x{room.gridSize}</p>
+            <div className="flex flex-wrap items-center gap-2 text-sm font-bold text-[#37474f]">
+              <span>Room ID: {room.id} • {room.gridSize}x{room.gridSize}</span>
+              <button
+                type="button"
+                onClick={handleCopyRoomId}
+                className="inline-flex items-center gap-1 rounded-lg bg-white px-2 py-1 text-[#2962ff] shadow-sm hover:bg-[#eaf1ff]"
+                aria-label="Copy room ID"
+              >
+                <ClipboardDocumentIcon className="h-4 w-4" />
+                Copy ID
+              </button>
+              {copyMessage && <span role="status" className="text-xs text-[#2e7d32]">{copyMessage}</span>}
+            </div>
           </div>
           <div className="flex items-center gap-4 text-sm font-bold">
             <span className="flex items-center gap-1 text-[#2962ff] bg-white px-3 py-1.5 rounded-xl shadow-sm">
@@ -487,6 +651,11 @@ export default function GameRoom() {
             </span>
             <span className="px-4 py-1.5 rounded-xl bg-[#ff5252] text-white uppercase shadow-sm">{room.status}</span>
           </div>
+          {gameError && (
+            <p role="alert" className="mb-5 w-full rounded-xl border-2 border-red-200 bg-red-50 p-3 text-sm font-bold text-red-700">
+              {gameError}
+            </p>
+          )}
         </div>
 
         {/* Status: WAITING */}
@@ -644,7 +813,7 @@ export default function GameRoom() {
                   style={{ gridTemplateColumns: `repeat(${room.gridSize}, minmax(0, 1fr))` }}
                 >
                   {gridInputs.map((val, i) => {
-                    const err = allErrors[i];
+                    const err = visibleErrors[i];
                     const isConflict = activeError?.conflictingCellIndex === i;
                     const isShaking = shakingCell === i;
                     const hasVal = val.trim() !== '';
@@ -665,6 +834,7 @@ export default function GameRoom() {
                             setSubmitErrorMessage(null);
                           }}
                           onChange={(e) => handleInputChange(i, e.target.value)}
+                          onBlur={() => setValidatedCells(prev => new Set(prev).add(i))}
                           onKeyDown={(e) => handleKeyDown(e, i)}
                           className={clsx(
                             getSetupCellSizeClass(room.gridSize),
@@ -733,7 +903,7 @@ export default function GameRoom() {
                 <ul className="space-y-4">
                   {room.players.map((p: Player, i: number) => {
                     const isCurrentTurn = room.currentTurnIndex === i;
-                    const isMe = p.id === socket.id;
+                    const isMe = p.id === playerId;
                     return (
                       <li key={i} className={clsx(
                         "p-4 rounded-2xl border-4 transition-all relative overflow-hidden", 
@@ -794,7 +964,8 @@ export default function GameRoom() {
 
               {/* The Bingo Grid in Playing state with proper gridTemplateColumns */}
               <div 
-                className="bingo-grid"
+                ref={bingoGridRef}
+                className="bingo-grid relative"
                 style={{ gridTemplateColumns: `repeat(${room.gridSize}, minmax(0, 1fr))` }}
               >
                 {me?.grid?.map((num: number | null, i: number) => {
@@ -807,10 +978,12 @@ export default function GameRoom() {
                       key={i}
                       onClick={() => handleCellClickPlay(numVal)}
                       disabled={isMarked || (chosenNumber !== null && chosenNumber !== numVal)}
+                      ref={element => { bingoCellRefs.current[i] = element; }}
                       className={clsx(
                         "bingo-cell",
                         getPlayingCellSizeClass(room.gridSize),
                         isMarked && "marked",
+                        completedLineCells.has(i) && "matched-line-cell",
                         isHighlight && "marked-other animate-pulse scale-105 shadow-[0_0_20px_#ff5252]"
                       )}
                     >
@@ -819,6 +992,50 @@ export default function GameRoom() {
                     </button>
                   );
                 })}
+                {lineOverlaySize.width > 0 && lineOverlaySize.height > 0 && (
+                  <svg
+                    className="pointer-events-none absolute inset-0 z-30 h-full w-full overflow-visible"
+                    viewBox={`0 0 ${lineOverlaySize.width} ${lineOverlaySize.height}`}
+                    preserveAspectRatio="none"
+                    aria-hidden="true"
+                  >
+                    <defs>
+                      <linearGradient id="bingo-win-gradient">
+                        <stop offset="0%" stopColor="#fff7ad" />
+                        <stop offset="48%" stopColor="#ffb000" />
+                        <stop offset="100%" stopColor="#fff7ad" />
+                      </linearGradient>
+                    </defs>
+                    {lineGeometry.map(line => (
+                      <g key={line.key}>
+                        <line
+                          x1={line.x1}
+                          y1={line.y1}
+                          x2={line.x2}
+                          y2={line.y2}
+                          pathLength="100"
+                          className="bingo-win-line bingo-win-line-shadow"
+                        />
+                        <line
+                          x1={line.x1}
+                          y1={line.y1}
+                          x2={line.x2}
+                          y2={line.y2}
+                          pathLength="100"
+                          className="bingo-win-line"
+                        />
+                        <line
+                          x1={line.x1}
+                          y1={line.y1}
+                          x2={line.x2}
+                          y2={line.y2}
+                          pathLength="100"
+                          className="bingo-win-line bingo-win-line-glint"
+                        />
+                      </g>
+                    ))}
+                  </svg>
+                )}
               </div>
             </div>
           </div>
@@ -826,33 +1043,84 @@ export default function GameRoom() {
 
         {/* Status: FINISHED */}
         {room.status === 'finished' && (
-          <div className="game-panel p-10 sm:p-16 rounded-[3rem] text-center max-w-2xl w-full border-8 border-white shadow-[0_20px_50px_rgba(0,0,0,0.3)] bg-gradient-to-b from-white to-[#fff8e1]">
-            <TrophyIcon className="w-32 h-32 text-[#ff8f00] mx-auto mb-6 drop-shadow-[0_10px_0_#c56000] animate-bounce" />
-            <h2 className="title-3d text-[#ff5252] drop-shadow-[0_6px_0_#c62828] mb-2">GAME OVER!</h2>
-            
-            <div className="bg-[#ffca28] text-white p-4 rounded-3xl shadow-inner border-4 border-white mb-10 transform -rotate-2 inline-block px-10">
-              <p className="text-3xl font-black uppercase">Winner: {room.winner}</p>
-            </div>
-            
-            <div className="bg-white rounded-3xl p-8 mb-10 shadow-lg border-4 border-[#e0e6ed]">
-              <h3 className="text-2xl font-black text-[#2962ff] mb-6 uppercase border-b-4 border-gray-100 pb-4">Final Scores</h3>
-              <div className="space-y-4">
-                {room.players.map((p: Player, i: number) => (
-                  <div key={i} className="flex justify-between items-center text-xl font-bold bg-[#f0f4f8] p-4 rounded-2xl border-b-4 border-gray-200">
-                    <span className="text-[#37474f]">{p.name}</span>
-                    <div className="flex items-center gap-2">
-                      <span className="text-[#ff8f00] text-3xl font-black">{getPlayerScore(p.grid, p.markedNumbers, room.gridSize)}</span>
-                      <TrophyIcon className="w-8 h-8 text-[#ffca28]" />
-                    </div>
-                  </div>
-                ))}
+          <section className="game-over-card w-full max-w-4xl overflow-hidden rounded-[2rem] border border-white/80 bg-white shadow-[0_30px_80px_rgba(15,23,42,0.28)]">
+            <div className="relative overflow-hidden bg-gradient-to-br from-[#1e3a8a] via-[#2563eb] to-[#38bdf8] px-6 py-10 text-center text-white sm:px-12 sm:py-14">
+              <div className="game-over-orb game-over-orb-one" />
+              <div className="game-over-orb game-over-orb-two" />
+              <div className="relative z-10 mx-auto flex h-20 w-20 items-center justify-center rounded-3xl border border-white/40 bg-white/15 shadow-xl backdrop-blur-sm">
+                <TrophyIcon className="h-12 w-12 text-[#ffe082] drop-shadow-lg" />
               </div>
+              <p className="relative z-10 mt-5 text-sm font-black uppercase tracking-[0.35em] text-blue-100">Bingo Blast</p>
+              <h2 className="relative z-10 mt-2 text-4xl font-black tracking-tight drop-shadow-md sm:text-6xl">Game Over</h2>
+              <p className="relative z-10 mt-3 text-base font-bold text-blue-100 sm:text-lg">The board is complete. Here are the final results.</p>
             </div>
 
-            <button onClick={() => router.push('/')} className="game-button game-button-blue w-full py-5 text-2xl shadow-[0_10px_0_#0039cb]">
-              Play Again
-            </button>
-          </div>
+            <div className="px-5 pb-7 sm:px-10 sm:pb-10">
+              <div className="game-winner-card relative z-20 mx-auto -mt-6 flex max-w-2xl flex-col items-center justify-between gap-4 rounded-2xl border border-amber-200 bg-gradient-to-r from-amber-50 via-white to-amber-50 p-5 shadow-[0_12px_30px_rgba(245,158,11,0.16)] sm:-mt-8 sm:flex-row sm:px-7">
+                <div className="flex items-center gap-4">
+                  <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-[#fbbf24] to-[#f97316] text-white shadow-lg shadow-amber-300/50">
+                    <TrophyIcon className="h-8 w-8" />
+                  </span>
+                  <div className="text-left">
+                    <p className="text-xs font-black uppercase tracking-[0.2em] text-amber-700">Champion</p>
+                    <p className="text-2xl font-black text-slate-800">{room.winner}</p>
+                  </div>
+                </div>
+                <span className="rounded-full bg-amber-100 px-4 py-2 text-sm font-black text-amber-800">First to Bingo!</span>
+              </div>
+
+              <div className="mx-auto mt-8 max-w-2xl">
+                <div className="mb-4 flex items-end justify-between border-b border-slate-200 pb-3">
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-[0.2em] text-blue-600">Leaderboard</p>
+                    <h3 className="mt-1 text-2xl font-black text-slate-800">Final scores</h3>
+                  </div>
+                  <span className="text-sm font-bold text-slate-500">{room.players.length} players</span>
+                </div>
+
+                <ol className="space-y-3">
+                  {finalScores.map(({ player, score }, index) => {
+                    const isWinner = player.id === room.winnerPlayerId
+                      || (!room.winnerPlayerId && player.name === room.winner);
+                    return (
+                      <li
+                        key={player.id}
+                        className={clsx(
+                          "flex items-center gap-4 rounded-2xl border p-4 transition-colors sm:p-5",
+                          isWinner
+                            ? "border-amber-300 bg-gradient-to-r from-amber-50 to-orange-50 shadow-sm"
+                            : "border-slate-200 bg-slate-50"
+                        )}
+                      >
+                        <span className={clsx(
+                          "flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg font-black",
+                          isWinner ? "bg-amber-400 text-white shadow-md" : "bg-white text-slate-500"
+                        )}>
+                          {index + 1}
+                        </span>
+                        <div className="min-w-0 flex-1 text-left">
+                          <p className="truncate text-lg font-black text-slate-800">{player.name}</p>
+                          <p className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                            {isWinner ? 'Winning player' : 'Final score'}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2 rounded-xl bg-white/80 px-3 py-2">
+                          <span className={clsx("text-2xl font-black", isWinner ? "text-amber-600" : "text-blue-700")}>{score}</span>
+                          <TrophyIcon className={clsx("h-6 w-6", isWinner ? "text-amber-400" : "text-slate-300")} />
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </div>
+
+              <div className="mx-auto mt-8 flex max-w-2xl flex-col gap-3 sm:flex-row">
+                <button onClick={() => router.push('/')} className="game-button game-button-blue flex-1 py-4 text-lg">
+                  Play Again
+                </button>
+              </div>
+            </div>
+          </section>
         )}
 
       </div>

@@ -161,12 +161,86 @@ body {
   text-shadow: 0 2px 4px rgba(0,0,0,0.3);
   transform: translateY(4px);
 }
+.bingo-cell.matched-line-cell {
+  opacity: 0.5;
+  filter: saturate(0.75);
+  transition: opacity 250ms ease-out, filter 250ms ease-out;
+}
 .bingo-cell.marked-other {
   background: linear-gradient(180deg, #ff5252, #c62828);
   color: white;
   box-shadow: 0 4px 0 #8e0000, inset 0 4px 0 rgba(255,255,255,0.5);
   text-shadow: 0 2px 4px rgba(0,0,0,0.3);
   transform: translateY(4px);
+}
+
+@keyframes drawAndFadeBingoWinLine {
+  0% { opacity: 0; stroke-dashoffset: 100; }
+  12% { opacity: 1; }
+  62% { opacity: 1; stroke-dashoffset: 0; }
+  100% { opacity: 0; stroke-dashoffset: 0; }
+}
+
+.bingo-win-line {
+  fill: none;
+  stroke: url(#bingo-win-gradient);
+  stroke-width: 5;
+  stroke-linecap: round;
+  stroke-dasharray: 100;
+  stroke-dashoffset: 100;
+  filter: drop-shadow(0 0 5px rgba(255, 190, 35, 0.95));
+  animation: drawAndFadeBingoWinLine 1.45s cubic-bezier(0.2, 0.75, 0.25, 1) forwards;
+  vector-effect: non-scaling-stroke;
+}
+
+.bingo-win-line-shadow {
+  stroke: rgba(30, 41, 59, 0.8);
+  stroke-width: 12;
+  filter: none;
+}
+
+.bingo-win-line-glint {
+  stroke: rgba(255, 255, 255, 0.9);
+  stroke-width: 1.5;
+  filter: none;
+}
+
+.game-over-card {
+  animation: gameOverReveal 650ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.game-over-orb {
+  position: absolute;
+  width: 15rem;
+  height: 15rem;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.12);
+  filter: blur(1px);
+  pointer-events: none;
+}
+
+.game-over-orb-one {
+  top: -9rem;
+  left: -4rem;
+}
+
+.game-over-orb-two {
+  right: -5rem;
+  bottom: -11rem;
+  width: 20rem;
+  height: 20rem;
+}
+
+@keyframes gameOverReveal {
+  from { opacity: 0; transform: translateY(18px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bingo-win-line,
+  .game-over-card {
+    animation-duration: 1ms;
+  }
 }
 
 @keyframes cellShake {

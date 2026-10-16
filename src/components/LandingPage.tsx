@@ -3,15 +3,27 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { useGameStore } from '@/store/gameStore';
-import { getSocket } from '@/lib/socket';
-import { SparklesIcon, KeyIcon, HashtagIcon, PlusCircleIcon, ArrowRightEndOnRectangleIcon, UserIcon } from '@heroicons/react/24/solid';
+import {
+  createRoom as createRoomRequest,
+  getAvailableRooms,
+  getRoom,
+  joinRoom as joinRoomRequest,
+  subscribeToPublicRooms,
+  type AvailableRoom
+} from '@/lib/gameApi';
+import { ensurePlayerSession } from '@/lib/supabase';
+import { SparklesIcon, KeyIcon, HashtagIcon, PlusCircleIcon, ArrowRightEndOnRectangleIcon, UserIcon, UsersIcon } from '@heroicons/react/24/solid';
 import gsap from 'gsap';
 
 export default function LandingPage() {
   const router = useRouter();
-  const { setPlayerName, setRoomId, setRoom } = useGameStore();
+  const { setPlayerName, setPlayerId, setRoomId, setRoom } = useGameStore();
   
   const [name, setName] = useState('');
+  const [availableRooms, setAvailableRooms] = useState<AvailableRoom[]>([]);
+  const [sessionReady, setSessionReady] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
   const [tab, setTab] = useState<'create' | 'join'>('create');
   
   // Create state
@@ -43,40 +55,79 @@ export default function LandingPage() {
     }
   }, []);
 
-  const handleCreate = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!name || !roomName) return;
-    
-    setPlayerName(name);
-    const socket = getSocket();
-    
-    socket.emit('createRoom', { roomName, isPrivate, password, gridSize, creatorName: name });
-    
-    socket.once('roomUpdated', (room) => {
+  useEffect(() => {
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+    void ensurePlayerSession()
+      .then(async playerId => {
+        if (!active) return;
+        setPlayerId(playerId);
+        setSessionReady(true);
+        setAvailableRooms(await getAvailableRooms());
+        if (active) {
+          unsubscribe = subscribeToPublicRooms(setAvailableRooms, error => setErrorMessage(error.message));
+        }
+      })
+      .catch(error => {
+        if (active) setErrorMessage(error instanceof Error ? error.message : 'Could not connect to the game service.');
+      });
+
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [setPlayerId]);
+
+  const joinRoom = async (roomId: string, roomPassword = '') => {
+    if (!name.trim() || busy) return;
+
+    setBusy(true);
+    setErrorMessage('');
+    try {
+      await ensurePlayerSession();
+      setPlayerName(name.trim());
+      const room = await joinRoomRequest(roomId, name.trim(), roomPassword);
       setRoom(room);
       setRoomId(room.id);
       router.push(`/room/${room.id}`);
-    });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not join this room.');
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const handleJoin = (e: React.FormEvent) => {
+  const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name || !joinRoomId) return;
-    
-    setPlayerName(name);
-    const socket = getSocket();
-    
-    socket.emit('joinRoom', { roomId: joinRoomId, password: joinPassword, playerName: name });
-    
-    socket.once('roomUpdated', (room) => {
+    if (!name.trim() || !roomName.trim() || busy) return;
+
+    setBusy(true);
+    setErrorMessage('');
+    try {
+      await ensurePlayerSession();
+      setPlayerName(name.trim());
+      const roomId = await createRoomRequest({
+        name: roomName.trim(),
+        gridSize: Number(gridSize),
+        isPrivate,
+        password,
+        playerName: name.trim()
+      });
+      const room = await getRoom(roomId);
       setRoom(room);
       setRoomId(room.id);
       router.push(`/room/${room.id}`);
-    });
-    
-    socket.once('error', (err) => {
-      alert(err);
-    });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not create the room.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleJoin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim() || !joinRoomId.trim()) return;
+    await joinRoom(joinRoomId, joinPassword);
   };
 
   return (
@@ -87,10 +138,15 @@ export default function LandingPage() {
         <div className="cloud cloud3"></div>
       </div>
 
-      <div className="flex flex-col items-center justify-center min-h-screen p-4">
-        <h1 ref={titleRef} className="title-3d">BINGO <span className="text-[#ff5252]">BLAST</span></h1>
+      <div className="mx-auto grid min-h-screen w-full max-w-6xl grid-cols-1 items-start gap-8 p-4 lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)]">
+        <h1 ref={titleRef} className="title-3d lg:col-span-2">BINGO <span className="text-[#ff5252]">BLAST</span></h1>
 
-        <div ref={panelRef} className="game-panel w-full max-w-md relative z-10">
+        <div ref={panelRef} className="game-panel w-full max-w-md relative z-10 mx-auto lg:mx-0">
+          {errorMessage && (
+            <p role="alert" className="mb-4 rounded-xl border-2 border-red-200 bg-red-50 p-3 text-sm font-bold text-red-700">
+              {errorMessage}
+            </p>
+          )}
           <div className="flex justify-center mb-6">
             <div className="bg-[#ffca28] p-4 rounded-full shadow-[0_4px_0_#c56000,0_8px_15px_rgba(0,0,0,0.2)] transform -translate-y-12 absolute border-4 border-white">
               <SparklesIcon className="w-10 h-10 text-white" />
@@ -184,10 +240,10 @@ export default function LandingPage() {
 
               <button 
                 type="submit"
-                disabled={!name || !roomName}
+                disabled={!sessionReady || busy || !name.trim() || !roomName.trim()}
                 className="game-button w-full py-4 mt-6 text-xl"
               >
-                Create Game
+                {busy ? 'Please wait...' : 'Create Game'}
               </button>
             </form>
           ) : (
@@ -217,14 +273,52 @@ export default function LandingPage() {
 
               <button 
                 type="submit"
-                disabled={!name || !joinRoomId}
+                disabled={!sessionReady || busy || !name.trim() || !joinRoomId.trim()}
                 className="game-button game-button-blue w-full py-4 mt-6 text-xl"
               >
-                Join Game
+                {busy ? 'Please wait...' : 'Join Game'}
               </button>
             </form>
           )}
         </div>
+
+        <section className="game-panel w-full relative z-10" aria-labelledby="public-rooms-title">
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <div>
+              <h2 id="public-rooms-title" className="text-2xl font-black text-[#37474f]">Public Rooms</h2>
+              <p className="text-sm font-bold text-[#37474f]/70">Join an open game without entering a room ID.</p>
+            </div>
+            <UsersIcon className="w-8 h-8 text-[#2962ff] shrink-0" />
+          </div>
+
+          {availableRooms.length === 0 ? (
+            <p className="bg-[#f0f4f8] rounded-2xl p-4 text-center font-bold text-[#37474f]/70">
+              No public rooms are available right now. Create one and invite your friends!
+            </p>
+          ) : (
+            <ul className="grid gap-3 sm:grid-cols-2">
+              {availableRooms.map((room) => (
+                <li key={room.id} className="flex items-center justify-between gap-3 rounded-2xl border-2 border-[#e0e6ed] bg-white p-4 shadow-sm">
+                  <div className="min-w-0">
+                    <h3 className="truncate font-black text-[#37474f]">{room.name}</h3>
+                    <p className="text-sm font-bold text-gray-500">
+                      {room.gridSize}x{room.gridSize} grid · {room.playerCount} {room.playerCount === 1 ? 'player' : 'players'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => joinRoom(room.id)}
+                    disabled={!sessionReady || busy || !name.trim()}
+                    className="game-button game-button-blue shrink-0 px-4 py-2 text-sm"
+                    aria-label={`Join ${room.name}`}
+                  >
+                    Join
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       </div>
     </>
   );

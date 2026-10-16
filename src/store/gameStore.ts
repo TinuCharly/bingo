@@ -3,7 +3,7 @@ import { create } from 'zustand';
 export interface Player {
   id: string;
   name: string;
-  grid?: (number | null)[];
+  grid?: (number | null)[] | null;
   markedNumbers: number[];
   hasSubmittedGrid?: boolean;
 }
@@ -19,26 +19,29 @@ export interface Room {
   currentTurnIndex: number;
   currentChosenNumber: number | null;
   winner: string | null;
+  winnerPlayerId: string | null;
+  setupDeadline?: string | null;
+  turnDeadline?: string | null;
 }
 
 interface GameState {
   playerName: string;
   roomId: string | null;
   room: Room | null;
-  socketId: string | null;
+  playerId: string | null;
   setPlayerName: (name: string) => void;
   setRoomId: (id: string | null) => void;
   setRoom: (room: Room | null) => void;
-  setSocketId: (id: string) => void;
+  setPlayerId: (id: string) => void;
 }
 
 export const useGameStore = create<GameState>((set) => ({
   playerName: '',
   roomId: null,
   room: null,
-  socketId: null,
+  playerId: null,
   setPlayerName: (name) => set({ playerName: name }),
   setRoomId: (id) => set({ roomId: id }),
   setRoom: (room) => set({ room }),
-  setSocketId: (id) => set({ socketId: id }),
+  setPlayerId: (id) => set({ playerId: id }),
 }));
